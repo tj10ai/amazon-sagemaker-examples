@@ -1,38 +1,54 @@
-# MS Access VBA + AWS WorkMail (IMAP/SMTP)
+# MS Access VBA Function for AWS WorkMail (No import required)
 
-This folder contains a VBA module you can import into an MS Access database to perform common WorkMail mailbox actions:
+This version is **copy/paste friendly** for MS Access.
 
-- Search/read emails from `INBOX` via IMAP (`SEARCH`, `UID` fetch)
-- Send emails via SMTP
-- Reply to an email by UID (adds `In-Reply-To` and `References`)
+If importing `.bas` is problematic in your environment, open a **Standard Module** in Access and paste the code from `WorkMailAccessModule.bas` directly.
 
-## Files
+## Main function
 
-- `WorkMailAccessModule.bas` – VBA module to import into Access.
-
-## Setup
-
-1. In Access, open the VBA editor (`ALT+F11`), then import `WorkMailAccessModule.bas`.
-2. Ensure `curl.exe` is available on your system `PATH`.
-3. Ensure AWS WorkMail user credentials are valid for IMAP/SMTP login.
-4. Use your WorkMail region endpoint format:
-   - IMAP: `imap.mail.<region>.awsapps.com:993`
-   - SMTP: `smtp.mail.<region>.awsapps.com:465`
-
-## Quick start
+Use one function for all operations:
 
 ```vb
-Dim cfg As WorkMailConfig
-cfg = NewWorkMailConfig("user@example.com", "PASSWORD", "us-east-1", "user@example.com")
-
-Debug.Print SearchInbox(cfg, "UNSEEN")
-Debug.Print FetchEmailByUID(cfg, "123")
-Debug.Print SendEmail(cfg, "recipient@example.com", "Hello", "Hi from Access")
-Debug.Print ReplyToUID(cfg, "123", "Thanks!")
+WorkMailExecute(action, username, password, region, mailFrom, [uid], [toAddress], [subject], [bodyText], [searchClause], [ccAddress], [bccAddress])
 ```
 
-## Notes and limitations
+### Supported actions
 
-- Credentials are passed to `curl` command line. In production, store secrets securely and avoid hard-coding passwords.
-- `ReplyToUID` uses basic header extraction and plain text body.
-- For HTML email and attachments, extend `BuildMessage` to emit MIME multipart payloads.
+- `SEARCH` -> IMAP `SEARCH` response from INBOX
+- `FETCH` -> Raw message content by UID
+- `SEND` -> Sends a new email via SMTP
+- `REPLY` -> Reads original by UID and sends reply with thread headers
+
+## Quick examples
+
+```vb
+Dim result As String
+
+' Search unread
+result = WorkMailExecute("SEARCH", "user@example.com", "PASSWORD", "us-east-1", "user@example.com", , , , , "UNSEEN")
+Debug.Print result
+
+' Fetch UID
+result = WorkMailExecute("FETCH", "user@example.com", "PASSWORD", "us-east-1", "user@example.com", "123")
+Debug.Print result
+
+' Send
+result = WorkMailExecute("SEND", "user@example.com", "PASSWORD", "us-east-1", "user@example.com", , "recipient@example.com", "Hello", "Hi from Access")
+Debug.Print result
+
+' Reply
+result = WorkMailExecute("REPLY", "user@example.com", "PASSWORD", "us-east-1", "user@example.com", "123", , , "Thanks!")
+Debug.Print result
+```
+
+## Requirements
+
+- `curl.exe` in PATH
+- WorkMail IMAP/SMTP access enabled
+- Region endpoints:
+  - IMAP: `imap.mail.<region>.awsapps.com:993`
+  - SMTP: `smtp.mail.<region>.awsapps.com:465`
+
+## Security note
+
+Credentials are passed to `curl` command line by this lightweight approach. For production, consider a more secure secret-handling strategy.

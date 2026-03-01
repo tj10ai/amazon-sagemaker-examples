@@ -1,103 +1,156 @@
-Attribute VB_Name = "WorkMailAccess"
 Option Compare Database
 Option Explicit
 
-' -----------------------------------------------------------------------------
-' MS Access VBA module for AWS WorkMail mailbox actions using curl.exe + IMAP/SMTP
-' -----------------------------------------------------------------------------
+' Copy/paste friendly MS Access VBA module (Standard Module)
+' for AWS WorkMail over IMAP/SMTP via curl.exe.
+'
+' How to use in Access:
+' 1) Create a new Standard Module, e.g. "modWorkMail".
+' 2) Paste this file content.
+' 3) Call WorkMailExecute(...) with one of: SEARCH, FETCH, SEND, REPLY.
+'
 ' Requirements:
-'   1) curl.exe available in PATH (Windows 10/11 ships with it by default)
-'   2) IMAP enabled for your WorkMail organization/user
-'   3) SMTP authentication enabled for your WorkMail user
-'   4) TLS endpoints, for example:
-'        IMAP: imap.mail.us-east-1.awsapps.com:993
-'        SMTP: smtp.mail.us-east-1.awsapps.com:465
-' -----------------------------------------------------------------------------
+' - curl.exe available in PATH
+' - WorkMail mailbox access over IMAP/SMTP enabled
+' - Region endpoints:
+'     IMAP: imap.mail.<region>.awsapps.com:993
+'     SMTP: smtp.mail.<region>.awsapps.com:465
 
 Private Const DEFAULT_IMAP_PORT As Long = 993
 Private Const DEFAULT_SMTP_PORT As Long = 465
 
-Public Type WorkMailConfig
-    Username As String
-    Password As String
-    ImapHost As String
-    ImapPort As Long
-    SmtpHost As String
-    SmtpPort As Long
-    MailFrom As String
-End Type
+' Main function requested for MS Access use.
+' Action values:
+'   SEARCH -> Result = raw SEARCH response
+'   FETCH  -> Result = raw message for uid
+'   SEND   -> Result = curl output for send operation
+'   REPLY  -> Result = curl output for reply operation
+Public Function WorkMailExecute(ByVal action As String, _
+                                ByVal username As String, _
+                                ByVal password As String, _
+                                ByVal region As String, _
+                                ByVal mailFrom As String, _
+                                Optional ByVal uid As String = "", _
+                                Optional ByVal toAddress As String = "", _
+                                Optional ByVal subject As String = "", _
+                                Optional ByVal bodyText As String = "", _
+                                Optional ByVal searchClause As String = "ALL", _
+                                Optional ByVal ccAddress As String = "", _
+                                Optional ByVal bccAddress As String = "") As String
 
-Public Function NewWorkMailConfig(ByVal username As String, _
-                                  ByVal password As String, _
-                                  ByVal region As String, _
-                                  ByVal mailFrom As String) As WorkMailConfig
-    Dim cfg As WorkMailConfig
-    cfg.Username = username
-    cfg.Password = password
-    cfg.ImapHost = "imap.mail." & region & ".awsapps.com"
-    cfg.ImapPort = DEFAULT_IMAP_PORT
-    cfg.SmtpHost = "smtp.mail." & region & ".awsapps.com"
-    cfg.SmtpPort = DEFAULT_SMTP_PORT
-    cfg.MailFrom = mailFrom
-    NewWorkMailConfig = cfg
+    Dim imapHost As String
+    Dim smtpHost As String
+    imapHost = "imap.mail." & region & ".awsapps.com"
+    smtpHost = "smtp.mail." & region & ".awsapps.com"
+
+    Dim normalizedAction As String
+    normalizedAction = UCase$(Trim$(action))
+
+    Select Case normalizedAction
+        Case "SEARCH"
+            WorkMailExecute = SearchInbox(username, password, imapHost, DEFAULT_IMAP_PORT, searchClause)
+
+        Case "FETCH"
+            If Len(Trim$(uid)) = 0 Then
+                WorkMailExecute = "ERROR: uid is required for FETCH"
+                Exit Function
+            End If
+            WorkMailExecute = FetchEmailByUID(username, password, imapHost, DEFAULT_IMAP_PORT, uid)
+
+        Case "SEND"
+            If Len(Trim$(toAddress)) = 0 Then
+                WorkMailExecute = "ERROR: toAddress is required for SEND"
+                Exit Function
+            End If
+            WorkMailExecute = SendEmail(username, password, smtpHost, DEFAULT_SMTP_PORT, mailFrom, toAddress, subject, bodyText, ccAddress, bccAddress)
+
+        Case "REPLY"
+            If Len(Trim$(uid)) = 0 Then
+                WorkMailExecute = "ERROR: uid is required for REPLY"
+                Exit Function
+            End If
+            WorkMailExecute = ReplyToUID(username, password, imapHost, DEFAULT_IMAP_PORT, smtpHost, DEFAULT_SMTP_PORT, mailFrom, uid, bodyText)
+
+        Case Else
+            WorkMailExecute = "ERROR: Unknown action. Use SEARCH, FETCH, SEND, or REPLY"
+    End Select
 End Function
 
-Public Function SendEmail(ByRef cfg As WorkMailConfig, _
-                          ByVal toAddress As String, _
-                          ByVal subject As String, _
-                          ByVal bodyText As String, _
-                          Optional ByVal ccAddress As String = "", _
-                          Optional ByVal bccAddress As String = "") As String
+Private Function SendEmail(ByVal username As String, _
+                           ByVal password As String, _
+                           ByVal smtpHost As String, _
+                           ByVal smtpPort As Long, _
+                           ByVal mailFrom As String, _
+                           ByVal toAddress As String, _
+                           ByVal subject As String, _
+                           ByVal bodyText As String, _
+                           ByVal ccAddress As String, _
+                           ByVal bccAddress As String) As String
     Dim emlPath As String
     emlPath = TempFilePath("workmail_send_", ".eml")
 
     Dim eml As String
-    eml = BuildMessage(cfg.MailFrom, toAddress, ccAddress, bccAddress, subject, bodyText, "", "")
+    eml = BuildMessage(mailFrom, toAddress, ccAddress, bccAddress, subject, bodyText, "", "")
     WriteTextFile emlPath, eml
 
     Dim cmd As String
-    cmd = "curl --silent --show-error --ssl-reqd " & _
-          " --url ""smtps://" & cfg.SmtpHost & ":" & cfg.SmtpPort & """ & _
-          " --user """ & EscapeQuotes(cfg.Username & ":" & cfg.Password) & """" & _
-          " --mail-from """ & EscapeQuotes(cfg.MailFrom) & """" & _
-          " --mail-rcpt """ & EscapeQuotes(toAddress) & """"
+    cmd = "curl --silent --show-error --ssl-reqd" & _
+          " --url ""smtps://" & smtpHost & ":" & smtpPort & """" & _
+          " --user """ & EscapeForCmd(username & ":" & password) & """" & _
+          " --mail-from """ & EscapeForCmd(mailFrom) & """" & _
+          " --mail-rcpt """ & EscapeForCmd(toAddress) & """"
 
     If Len(Trim$(ccAddress)) > 0 Then
-        cmd = cmd & " --mail-rcpt """ & EscapeQuotes(ccAddress) & """"
+        cmd = cmd & " --mail-rcpt """ & EscapeForCmd(ccAddress) & """"
     End If
 
     If Len(Trim$(bccAddress)) > 0 Then
-        cmd = cmd & " --mail-rcpt """ & EscapeQuotes(bccAddress) & """"
+        cmd = cmd & " --mail-rcpt """ & EscapeForCmd(bccAddress) & """"
     End If
 
-    cmd = cmd & " --upload-file """ & EscapeQuotes(emlPath) & """"
+    cmd = cmd & " --upload-file """ & EscapeForCmd(emlPath) & """"
 
     SendEmail = RunCommandAndCapture(cmd)
 End Function
 
-Public Function SearchInbox(ByRef cfg As WorkMailConfig, _
-                            Optional ByVal searchClause As String = "ALL") As String
+Private Function SearchInbox(ByVal username As String, _
+                             ByVal password As String, _
+                             ByVal imapHost As String, _
+                             ByVal imapPort As Long, _
+                             ByVal searchClause As String) As String
     Dim cmd As String
-    cmd = "curl --silent --show-error --ssl-reqd " & _
-          " --url ""imaps://" & cfg.ImapHost & ":" & cfg.ImapPort & "/INBOX""" & _
-          " --user """ & EscapeQuotes(cfg.Username & ":" & cfg.Password) & """" & _
-          " -X ""SEARCH " & EscapeQuotes(searchClause) & """"
+    cmd = "curl --silent --show-error --ssl-reqd" & _
+          " --url ""imaps://" & imapHost & ":" & imapPort & "/INBOX""" & _
+          " --user """ & EscapeForCmd(username & ":" & password) & """" & _
+          " -X ""SEARCH " & EscapeForCmd(searchClause) & """"
+
     SearchInbox = RunCommandAndCapture(cmd)
 End Function
 
-Public Function FetchEmailByUID(ByRef cfg As WorkMailConfig, ByVal uid As String) As String
+Private Function FetchEmailByUID(ByVal username As String, _
+                                 ByVal password As String, _
+                                 ByVal imapHost As String, _
+                                 ByVal imapPort As Long, _
+                                 ByVal uid As String) As String
     Dim cmd As String
-    cmd = "curl --silent --show-error --ssl-reqd " & _
-          " --url ""imaps://" & cfg.ImapHost & ":" & cfg.ImapPort & "/INBOX/;UID=" & EscapeQuotes(uid) & """" & _
-          " --user """ & EscapeQuotes(cfg.Username & ":" & cfg.Password) & """"
+    cmd = "curl --silent --show-error --ssl-reqd" & _
+          " --url ""imaps://" & imapHost & ":" & imapPort & "/INBOX/;UID=" & EscapeForCmd(uid) & """" & _
+          " --user """ & EscapeForCmd(username & ":" & password) & """"
+
     FetchEmailByUID = RunCommandAndCapture(cmd)
 End Function
 
-Public Function ReplyToUID(ByRef cfg As WorkMailConfig, _
-                           ByVal uid As String, _
-                           ByVal replyBody As String) As String
+Private Function ReplyToUID(ByVal username As String, _
+                            ByVal password As String, _
+                            ByVal imapHost As String, _
+                            ByVal imapPort As Long, _
+                            ByVal smtpHost As String, _
+                            ByVal smtpPort As Long, _
+                            ByVal mailFrom As String, _
+                            ByVal uid As String, _
+                            ByVal replyBody As String) As String
     Dim original As String
-    original = FetchEmailByUID(cfg, uid)
+    original = FetchEmailByUID(username, password, imapHost, imapPort, uid)
 
     Dim originalFrom As String
     Dim originalSubject As String
@@ -114,6 +167,8 @@ Public Function ReplyToUID(ByRef cfg As WorkMailConfig, _
 
     Dim replySubject As String
     replySubject = originalSubject
+    If Len(Trim$(replySubject)) = 0 Then replySubject = "(No Subject)"
+
     If InStr(1, LCase$(replySubject), "re:", vbTextCompare) <> 1 Then
         replySubject = "Re: " & replySubject
     End If
@@ -122,16 +177,16 @@ Public Function ReplyToUID(ByRef cfg As WorkMailConfig, _
     emlPath = TempFilePath("workmail_reply_", ".eml")
 
     Dim replyMsg As String
-    replyMsg = BuildMessage(cfg.MailFrom, originalFrom, "", "", replySubject, replyBody, originalMessageId, originalMessageId)
+    replyMsg = BuildMessage(mailFrom, originalFrom, "", "", replySubject, replyBody, originalMessageId, originalMessageId)
     WriteTextFile emlPath, replyMsg
 
     Dim cmd As String
-    cmd = "curl --silent --show-error --ssl-reqd " & _
-          " --url ""smtps://" & cfg.SmtpHost & ":" & cfg.SmtpPort & """ & _
-          " --user """ & EscapeQuotes(cfg.Username & ":" & cfg.Password) & """" & _
-          " --mail-from """ & EscapeQuotes(cfg.MailFrom) & """" & _
-          " --mail-rcpt """ & EscapeQuotes(originalFrom) & """" & _
-          " --upload-file """ & EscapeQuotes(emlPath) & """"
+    cmd = "curl --silent --show-error --ssl-reqd" & _
+          " --url ""smtps://" & smtpHost & ":" & smtpPort & """" & _
+          " --user """ & EscapeForCmd(username & ":" & password) & """" & _
+          " --mail-from """ & EscapeForCmd(mailFrom) & """" & _
+          " --mail-rcpt """ & EscapeForCmd(originalFrom) & """" & _
+          " --upload-file """ & EscapeForCmd(emlPath) & """"
 
     ReplyToUID = RunCommandAndCapture(cmd)
 End Function
@@ -195,12 +250,8 @@ Private Function ExtractHeaderValue(ByVal rawMessage As String, ByVal headerName
 End Function
 
 Private Function TempFilePath(ByVal prefix As String, ByVal extension As String) As String
-    Dim fso As Object
-    Set fso = CreateObject("Scripting.FileSystemObject")
-
     Dim tempFolder As String
     tempFolder = Environ$("TEMP")
-
     TempFilePath = tempFolder & "\" & prefix & Format$(Now, "yyyymmdd_hhnnss") & "_" & CLng(Timer * 1000) & extension
 End Function
 
@@ -208,16 +259,16 @@ Private Sub WriteTextFile(ByVal filePath As String, ByVal contents As String)
     Dim stm As Object
     Set stm = CreateObject("ADODB.Stream")
 
-    stm.Type = 2 ' adTypeText
+    stm.Type = 2
     stm.Charset = "utf-8"
     stm.Open
     stm.WriteText contents
-    stm.SaveToFile filePath, 2 ' adSaveCreateOverWrite
+    stm.SaveToFile filePath, 2
     stm.Close
 End Sub
 
-Private Function EscapeQuotes(ByVal value As String) As String
-    EscapeQuotes = Replace(value, """", "\""")
+Private Function EscapeForCmd(ByVal value As String) As String
+    EscapeForCmd = Replace(value, """", "\""")
 End Function
 
 Private Function RunCommandAndCapture(ByVal cmd As String) As String
@@ -227,41 +278,39 @@ Private Function RunCommandAndCapture(ByVal cmd As String) As String
     Dim execObj As Object
     Set execObj = shell.Exec("cmd /c " & cmd)
 
-    Dim output As String
-    output = ""
-
     Do While execObj.Status = 0
         DoEvents
     Loop
 
-    If Not execObj.StdOut.AtEndOfStream Then
-        output = output & execObj.StdOut.ReadAll
-    End If
+    Dim output As String
+    output = ""
 
-    If Not execObj.StdErr.AtEndOfStream Then
-        output = output & vbCrLf & execObj.StdErr.ReadAll
-    End If
+    If Not execObj.StdOut.AtEndOfStream Then output = output & execObj.StdOut.ReadAll
+    If Not execObj.StdErr.AtEndOfStream Then output = output & vbCrLf & execObj.StdErr.ReadAll
 
     RunCommandAndCapture = Trim$(output)
 End Function
 
 Public Sub ExampleUsage()
-    Dim cfg As WorkMailConfig
-    cfg = NewWorkMailConfig( _
-        "user@example.com", _
-        "APP_PASSWORD_OR_MAILBOX_PASSWORD", _
-        "us-east-1", _
-        "user@example.com")
+    Dim username As String
+    Dim password As String
+    Dim region As String
+    Dim mailFrom As String
+
+    username = "user@example.com"
+    password = "APP_PASSWORD_OR_MAILBOX_PASSWORD"
+    region = "us-east-1"
+    mailFrom = "user@example.com"
 
     Debug.Print "=== SEARCH ==="
-    Debug.Print SearchInbox(cfg, "UNSEEN")
+    Debug.Print WorkMailExecute("SEARCH", username, password, region, mailFrom, , , , , "UNSEEN")
 
     Debug.Print "=== FETCH UID 123 ==="
-    Debug.Print FetchEmailByUID(cfg, "123")
+    Debug.Print WorkMailExecute("FETCH", username, password, region, mailFrom, "123")
 
     Debug.Print "=== SEND ==="
-    Debug.Print SendEmail(cfg, "recipient@example.com", "Test from Access", "Hello from Access VBA + WorkMail")
+    Debug.Print WorkMailExecute("SEND", username, password, region, mailFrom, , "recipient@example.com", "Test from Access", "Hello from Access VBA + WorkMail")
 
     Debug.Print "=== REPLY UID 123 ==="
-    Debug.Print ReplyToUID(cfg, "123", "Thanks, received your email.")
+    Debug.Print WorkMailExecute("REPLY", username, password, region, mailFrom, "123", , , "Thanks, received your email.")
 End Sub
