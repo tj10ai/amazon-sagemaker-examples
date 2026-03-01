@@ -2,11 +2,14 @@
 """AWS WorkMail IMAP/SMTP client.
 
 This script uses WorkMail mailbox access credentials (username/password)
-with standard IMAP and SMTP protocols to:
-- list folders
-- read messages
-- send messages
-- reply to a message
+with standard IMAP and SMTP protocols to support:
+- ReadEmail(folder, position)
+- DeleteEmail(ID)
+- SendEmail(To, Subject, Body)
+
+To align with WorkMail IMAP behavior, this client uses IMAP UID values as the
+email "ID" so identifiers remain stable even when mailbox sequence positions
+change.
 
 Required environment variables:
   WORKMAIL_USERNAME  WorkMail mailbox username (often full email address)
@@ -70,30 +73,30 @@ class WorkMailClient:
 
     def list_folders(self) -> list[str]:
         with imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port) as imap:
-            self._imap_login(imap)
+            self._imap_login(imap, self.config.username, self.config.password)
             status, raw = imap.list()
             self._assert_ok(status, "Failed to list folders")
             return [line.decode("utf-8", errors="replace") for line in (raw or [])]
 
     def list_messages(self, folder: str = "INBOX", limit: int = 10) -> list[dict]:
         with imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port) as imap:
-            self._imap_login(imap)
+            self._imap_login(imap, self.config.username, self.config.password)
             status, _ = imap.select(folder, readonly=True)
             self._assert_ok(status, f"Failed to select folder {folder!r}")
-            status, data = imap.search(None, "ALL")
+            status, data = imap.uid("search", None, "ALL")
             self._assert_ok(status, "Failed to search messages")
-            ids = data[0].split() if data and data[0] else []
-            selected_ids = ids[-limit:]
+            uids = data[0].split() if data and data[0] else []
+            selected_uids = uids[-limit:]
 
             messages: list[dict] = []
-            for msg_id in reversed(selected_ids):
-                status, msg_data = imap.fetch(msg_id, "(RFC822.HEADER)")
-                self._assert_ok(status, f"Failed to fetch message {msg_id.decode()}")
+            for uid in reversed(selected_uids):
+                status, msg_data = imap.uid("fetch", uid, "(RFC822.HEADER)")
+                self._assert_ok(status, f"Failed to fetch message UID {uid.decode()}")
                 header_bytes = self._extract_message_bytes(msg_data)
                 msg = email.message_from_bytes(header_bytes)
                 messages.append(
                     {
-                        "id": msg_id.decode(),
+                        "id": uid.decode(),
                         "from": self._decode_header(msg.get("From", "")),
                         "to": self._decode_header(msg.get("To", "")),
                         "subject": self._decode_header(msg.get("Subject", "")),
@@ -106,11 +109,11 @@ class WorkMailClient:
 
     def read_message(self, message_id: str, folder: str = "INBOX") -> dict:
         with imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port) as imap:
-            self._imap_login(imap)
+            self._imap_login(imap, self.config.username, self.config.password)
             status, _ = imap.select(folder, readonly=True)
             self._assert_ok(status, f"Failed to select folder {folder!r}")
-            status, msg_data = imap.fetch(message_id, "(RFC822)")
-            self._assert_ok(status, f"Failed to fetch message {message_id}")
+            status, msg_data = imap.uid("fetch", message_id, "(RFC822)")
+            self._assert_ok(status, f"Failed to fetch message UID {message_id}")
             raw_message = self._extract_message_bytes(msg_data)
             message = email.message_from_bytes(raw_message)
 
@@ -128,6 +131,50 @@ class WorkMailClient:
                 "text_body": text_body,
                 "html_body": html_body,
             }
+
+    def ReadEmail(self, folder: str, position: str) -> dict:
+        """Read an email using folder and relative position semantics.
+
+        position accepts:
+        - "first": oldest message in folder
+        - "ID:<uid>" or "id:<uid>": read a specific UID
+        - "next:<uid>": next UID after the given UID
+        - "previous:<uid>": previous UID before the given UID
+        """
+        with imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port) as imap:
+            self._imap_login(imap, self.config.username, self.config.password)
+            status, _ = imap.select(folder, readonly=True)
+            self._assert_ok(status, f"Failed to select folder {folder!r}")
+            status, data = imap.uid("search", None, "ALL")
+            self._assert_ok(status, "Failed to search messages")
+            uids = [uid.decode() for uid in (data[0].split() if data and data[0] else [])]
+
+        if not uids:
+            raise RuntimeError(f"No emails found in folder {folder!r}")
+
+        selected_uid = self._resolve_position_to_uid(uids=uids, position=position)
+        return self.read_message(message_id=selected_uid, folder=folder)
+
+    def DeleteEmail(self, ID: str, folder: str = "INBOX") -> None:
+        """Delete an email by UID (unique IMAP identifier)."""
+        with imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port) as imap:
+            self._imap_login(imap, self.config.username, self.config.password)
+            status, _ = imap.select(folder)
+            self._assert_ok(status, f"Failed to select folder {folder!r}")
+
+            status, _ = imap.uid("store", ID, "+FLAGS", r"(\Deleted)")
+            self._assert_ok(status, f"Failed to mark message UID {ID} for deletion")
+
+            status, _ = imap.expunge()
+            self._assert_ok(status, f"Failed to expunge deleted message UID {ID}")
+
+    def SendEmail(self, To: str, Subject: str, Body: str) -> str:
+        """Send email using requested function-call naming."""
+        return self.send_email(
+            to_addresses=_split_csv(To),
+            subject=Subject,
+            body=Body,
+        )
 
     def send_email(
         self,
@@ -216,10 +263,48 @@ class WorkMailClient:
             raise RuntimeError(message)
 
     @staticmethod
-    def _imap_login(imap: imaplib.IMAP4_SSL) -> None:
-        status, _ = imap.login(os.environ["WORKMAIL_USERNAME"], os.environ["WORKMAIL_PASSWORD"])
+    def _imap_login(imap: imaplib.IMAP4_SSL, username: str, password: str) -> None:
+        status, _ = imap.login(username, password)
         if status != "OK":
             raise RuntimeError("IMAP login failed")
+
+    @staticmethod
+    def _resolve_position_to_uid(uids: list[str], position: str) -> str:
+        normalized = position.strip()
+        if normalized.lower() == "first":
+            return uids[0]
+
+        if ":" not in normalized:
+            raise ValueError(
+                "position must be one of: first, ID:<uid>, next:<uid>, previous:<uid>"
+            )
+
+        label, raw_uid = normalized.split(":", 1)
+        label = label.lower().strip()
+        uid = raw_uid.strip()
+
+        if label == "id":
+            if uid not in uids:
+                raise ValueError(f"UID {uid} not found in selected folder")
+            return uid
+
+        if uid not in uids:
+            raise ValueError(f"UID {uid} not found in selected folder")
+
+        idx = uids.index(uid)
+        if label == "next":
+            if idx + 1 >= len(uids):
+                raise ValueError(f"No next email after UID {uid}")
+            return uids[idx + 1]
+
+        if label == "previous":
+            if idx == 0:
+                raise ValueError(f"No previous email before UID {uid}")
+            return uids[idx - 1]
+
+        raise ValueError(
+            "position must be one of: first, ID:<uid>, next:<uid>, previous:<uid>"
+        )
 
     @staticmethod
     def _extract_message_bytes(msg_data) -> bytes:
@@ -271,9 +356,21 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--folder", default="INBOX", help="Folder/mailbox name (default: INBOX)")
     list_cmd.add_argument("--limit", type=int, default=10, help="Max messages to list (default: 10)")
 
-    read_cmd = subparsers.add_parser("read", help="Read one message by IMAP sequence id")
-    read_cmd.add_argument("--id", required=True, help="IMAP message sequence id")
+    read_cmd = subparsers.add_parser("read", help="Read one message by IMAP UID")
+    read_cmd.add_argument("--id", required=True, help="IMAP UID")
     read_cmd.add_argument("--folder", default="INBOX", help="Folder/mailbox name (default: INBOX)")
+
+    read_by_pos_cmd = subparsers.add_parser("read-position", help="Read by position label")
+    read_by_pos_cmd.add_argument("--folder", default="INBOX", help="Folder/mailbox name (default: INBOX)")
+    read_by_pos_cmd.add_argument(
+        "--position",
+        required=True,
+        help="Position selector: first | ID:<uid> | next:<uid> | previous:<uid>",
+    )
+
+    delete_cmd = subparsers.add_parser("delete", help="Delete one message by IMAP UID")
+    delete_cmd.add_argument("--id", required=True, help="IMAP UID")
+    delete_cmd.add_argument("--folder", default="INBOX", help="Folder/mailbox name (default: INBOX)")
 
     send_cmd = subparsers.add_parser("send", help="Send a new email")
     send_cmd.add_argument("--to", required=True, help="Comma-separated recipients")
@@ -284,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     send_cmd.add_argument("--html-body", help="Optional HTML body")
 
     reply_cmd = subparsers.add_parser("reply", help="Reply to an existing message")
-    reply_cmd.add_argument("--id", required=True, help="IMAP message sequence id")
+    reply_cmd.add_argument("--id", required=True, help="IMAP UID")
     reply_cmd.add_argument("--body", required=True, help="Reply body")
     reply_cmd.add_argument("--folder", default="INBOX", help="Folder/mailbox name (default: INBOX)")
     reply_cmd.add_argument("--reply-all", action="store_true", help="Reply-all behavior")
@@ -321,15 +418,34 @@ def main() -> None:
             print(message.get("html_body", ""))
         return
 
+    if args.command == "read-position":
+        message = client.ReadEmail(folder=args.folder, position=args.position)
+        for key in ["id", "from", "to", "subject", "date", "message_id", "in_reply_to"]:
+            print(f"{key}: {message.get(key, '')}")
+        print("\n--- text body ---")
+        print(message.get("text_body", ""))
+        if message.get("html_body"):
+            print("\n--- html body ---")
+            print(message.get("html_body", ""))
+        return
+
+    if args.command == "delete":
+        client.DeleteEmail(ID=args.id, folder=args.folder)
+        print(f"Deleted email UID: {args.id}")
+        return
+
     if args.command == "send":
-        msg_id = client.send_email(
-            to_addresses=_split_csv(args.to),
-            cc_addresses=_split_csv(args.cc),
-            bcc_addresses=_split_csv(args.bcc),
-            subject=args.subject,
-            body=args.body,
-            html_body=args.html_body,
-        )
+        if args.cc or args.bcc or args.html_body:
+            msg_id = client.send_email(
+                to_addresses=_split_csv(args.to),
+                cc_addresses=_split_csv(args.cc),
+                bcc_addresses=_split_csv(args.bcc),
+                subject=args.subject,
+                body=args.body,
+                html_body=args.html_body,
+            )
+        else:
+            msg_id = client.SendEmail(To=args.to, Subject=args.subject, Body=args.body)
         print(f"Sent email with Message-ID: {msg_id}")
         return
 
